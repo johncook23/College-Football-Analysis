@@ -2,14 +2,14 @@
 title: "College Football Analysis"
 format: gfm
 ---
+Transfer portal recruits come with a star rating. This project asks how much that rating tells us about on-field production, and what else matters. Using five seasons of college football data (2021-2025), I find that ratings predict production only weakly, and that the quality of the offense a player lands on matters more.
 
 ## Data Prep
-
-Here I want to merge in a new API connection
-
-
+Player data (PPA, usage, recruiting, portal, and draft info) comes from the CollegeFootballData API. I pulled team records and team offensive/defensive PPA for each season and merged them on `team` + `season`, so each player carries his team's success. This cell is not run when the README renders, so no API key is needed.
 ```{python}
 #| eval: false
+import pandas as pd
+import requests
 
 API_KEY = "api_here"
 HEADERS = {"Authorization": f"Bearer {API_KEY}"}
@@ -26,10 +26,6 @@ def pull(endpoint, years=range(2021, 2026)):
 records = pull("records").rename(columns={"year": "season"})
 ppa_teams = pull("ppa/teams")
 
-# Check the real column names before trusting the selections below
-print(records.columns.tolist())
-print(ppa_teams.columns.tolist())
-
 records_slim = records[["season", "team", "total.wins", "total.losses"]].rename(
     columns={"total.wins": "team_wins", "total.losses": "team_losses"})
 
@@ -40,7 +36,7 @@ ppa_slim = ppa_teams[["season", "team", "offense.overall", "defense.overall"]].r
 
 team_success = records_slim.merge(ppa_slim, on=["season", "team"], how="left")
 
-team_success.to_csv("~/College-Football-Analysis/team_success.csv")
+team_success.to_csv("~/College-Football-Analysis/team_success.csv", index=False)
 ```
 
 
@@ -52,13 +48,15 @@ import matplotlib.pyplot as plt
 from scipy import stats
 import statsmodels.formula.api as smf
 
-cfb = pd.read_csv("~/College-Football-Analysis/master_cfb_2021-2025.csv", low_memory=False)
-team_success = pd.read_csv("~/College-Football-Analysis/team_success.csv")
+cfb = pd.read_csv("master_cfb_2021-2025.csv", low_memory=False)
+team_success = pd.read_csv("team_success.csv")
 
 cfb = cfb.merge(team_success, on=["season", "team"], how="left")
 ```
 
-## Quick sanity check of the data
+## Data Sanity Check
+The dataset has about 69,000 player-seasons and 143 columns (before the team columns were added), with roughly 12,000-15,000 rows per season. There are no fully duplicated rows, but about 700 athlete-season pairs (about 1%) repeat, so I flag that as a limitation. Most columns are mostly empty (75 are over 90% empty) because stats are position-specific and high school recruiting data
+covers very few players.
 ```{python}
 cfb[["season", "team", "athlete_id", "name_ppa", "team_wins", "team_losses",
         "team_win_pct", "team_off_ppa", "team_def_ppa"]].head(10)
@@ -69,23 +67,22 @@ cfb[["team_wins","team_losses","team_win_pct", "team_off_ppa", "team_def_ppa"]].
 # One row per team-season, to sanity-check the team data itself
 team_success.sort_values("team_win_pct", ascending=False).head(10)
 
-# 2. Missing values per column (% missing), worst first
+# Missing values per column (% missing), worst first
 missing = (cfb.isna().mean() * 100).round(1).sort_values(ascending=False)
 print(missing.head(25))
 print((missing == 100).sum(), "columns are 100% empty")
 print((missing > 90).sum(), "columns are >90% empty")
 
-# 3. Duplicates
+# Duplicates
 print("Fully duplicated rows:", cfb.duplicated().sum())
 print("Duplicate athlete_id + season:", cfb.duplicated(subset=["athlete_id", "season"]).sum())
 
-# 4. Rows per season
+# Rows per season
 print(cfb["season"].value_counts().sort_index())
 cfb.columns
 ```
 
-## For Fun: comparing offenses accross conferences
-
+## For Fun: Comparing Offenses Accross Conferences
 ```{python}
 # 1. Sanity check: top 10 team-seasons by win % (8+ games to skip tiny samples)
 top = team_success[(team_success["team_wins"] + team_success["team_losses"]) >= 8]
@@ -114,6 +111,8 @@ plt.xlabel("Conference")
 plt.ylabel("Win Percentage")
 plt.show()
 ```
+**Findings:** Win percentage varies widely across and within conferences. The SEC has the highest median win percentage which is not too surprising. The Big 10 has the largest spread, given that this conference features premiere teams like Ohio State, Indiana, and Penn State while also hosting teams like Rutgers and Maryland. The takeaway for this project is that team quality differs a lot, even among Power 5 teams. "Ind" is the group of independent programs, which includes Notre Dame, explaining the high median and large range for this boxplot.
+
 
 ## How does Usage impact Predicted Points Added (PPA)
 ```{python}
@@ -139,28 +138,32 @@ g.set_axis_labels("Total Usage (share of team plays)", "Average PPA")
 g.figure.suptitle("Offense: Average PPA vs. Total Usage by Position, 2021-2025", y=1.02)
 plt.show()
 ```
+**Findings:** Usage and PPA behave very differently by position. QBs have by far the highest usage (median about 26% of team plays) but only modest PPA (about 0.22), while WRs and TEs have low usage (about 3-4%) and high PPA (about 0.65). PPA also becomes less volatile as usage rises: players with under 3% usage have wildly varying PPA, while heavy-usage players cluster tightly near 0.2. That is why the later analysis excludes players with under 3% usage.
+
 
 ## Creating Offense only transfer portal data frame
+I kept only players with transfer portal information (3,373 player-seasons) and dropped the defensive and special teams columns, leaving 109 columns. Every remaining player has PPA, which exists only for QB, RB, WR, TE, and FB. Star ratings are available for 94% of these players, and the numeric rating for 61%.
 ```{python}
 portal_cols = ["origin", "transfer_date", "rating.y", "stars.y", "eligibility"]
 
 transfers = cfb[cfb[portal_cols].notna().any(axis=1)].copy()
 
-print(transfers.shape) 
-missing = (transfers.isna().mean() * 100).round(1).sort_values(ascending=False)
+
 transfers.columns.tolist()
 drop_prefixes = (
-    "defensive_", "interceptions_",                  # defense
-    "kicking_", "kick_returns_", "punting_", "punt_returns_",  # special teams
-)
+    "defensive_", "interceptions_",                  
+    "kicking_", "kick_returns_", "punting_", "punt_returns_",)
 
 drop_cols = [c for c in transfers.columns if c.startswith(drop_prefixes)]
 transfers = transfers.drop(columns=drop_cols)
 ```
 
 ## Do ratings indicate better play?
+**Question:** When a player enters the transfer portal, does their star rating tell us how well they'll perform at their new school?
 
+**Data:** About 2,500 offensive transfers (QB, RB, WR, TE) from 2021-2025. Production is measured by average PPA (predicted points added per play). Players with very few touches were excluded so tiny samples don't distort results.
 ```{python}
+# Keep offensive skill positions, players with a star rating, and a minimum usage
 stars_df = transfers.dropna(subset=["stars.y"])
 stars_df = stars_df[
     (stars_df["usg_overall"] >= 0.03)
@@ -192,16 +195,11 @@ g.set_axis_labels("Transfer Portal Stars", "Average PPA")
 g.figure.suptitle("Average PPA by Transfer Star Rating and Position", y=1.02)
 plt.show()
 ```
+**Findings:** Higher-rated transfers have higher median PPA at every position. The gap between 3-star and 4-5 star players is about +0.14 for WR, +0.15 for TE, +0.08 for QB, and +0.07 for RB. The boxes overlap heavily, though, so many lower-rated players outproduce higher-rated ones.
 
 ## Do Transfer Portal Star Ratings Predict Production?
-
-**Question:** When a player enters the transfer portal, does their star rating
-tell us how well they'll perform at their new school?
-
-**Data:** About 2,500 offensive transfers (QB, RB, WR, TE) from 2021-2025.
-Production is measured by average PPA (predicted points added per play).
-Players with very few touches were excluded so tiny samples don't distort results.
 ```{python}
+# 1. Summary table
 summary = (
     stars_df.groupby(["position_ppa", "stars_grp"])["avg_PPA_all"]
     .agg(
@@ -229,20 +227,14 @@ for pos, d in stars_df.groupby("position_ppa"):
 print(pd.DataFrame(rows))
 ```
 **Findings**
-- Higher-rated transfers tend to produce more. At every position, 4-5 star
-  transfers had a higher median PPA than 3-star transfers (for example,
-  WRs: 0.76 vs. 0.62).
-- The relationship is real but weak. Correlations between rating and PPA were
-  around 0.2 at every position, meaning a rating explains only a small share of
-  how a player performs. Many low-rated transfers outplayed high-rated ones.
-- Statistical tests (Kruskal-Wallis, Spearman correlation) support the pattern
-  for QB, RB, and WR. TE is borderline because of its small sample.
+- Ratings and production are positively related at every position, but weakly: Spearman correlations are about 0.17-0.22.
+- The differences are statistically significant for QB, RB, and WR, and borderline for TE (p = 0.056), which has a small sample.
+- Ratings do not predict that 3-stars are "hit or miss." Their spread is wider mainly because there are many more of them.
 
 **Takeaway:** Star ratings are a useful starting point for evaluating a
 transfer, but they are far from the whole story.
 
 ## Regression
-
 ```{python}
 reg = transfers.dropna(subset=["stars.y", "team_off_ppa"])
 reg = reg[
@@ -264,9 +256,14 @@ print(m0.summary().tables[1])
 print(m1.summary().tables[1])
 print("R2:", round(m0.rsquared, 3), round(m1.rsquared, 3))
 ```
+But how much of that star advantage is about the player, and how much is about where he lands? Model 1 uses only stars and position. Model 2 adds usage and the strength of the team's offense.
+- Each extra star is worth +0.085 PPA in Model 1, but only +0.049 in Model 2, a drop of about 43%.
+- A team's offensive PPA has a coefficient of 0.67, and usage 0.25.
+- R² barely changes (0.375 to 0.406), because position explains most of the variation.
+
+Nearly half of the star advantage came from highly rated players landing on better offenses and getting more touches.
 
 ## Being on a better offense effects PPA more than stars
-
 ```{python}
 viz = transfers.dropna(subset=["stars.y", "team_off_ppa"])
 viz = viz[
@@ -303,3 +300,13 @@ plt.ylabel("PPA vs. Position Average")
 plt.legend(title="Portal Stars")
 plt.show()
 ```
+The final chart splits transfers into thirds by the strength of their new offense. PPA climbs steadily from weak to strong offenses within every star group, a larger move than the gap between star groups inside any one tier. In other words, a 3-star on a strong offense looks better than a 4-star on a weak one. The "2 or fewer" group has only about 50 players per tier, so I treat its bars with caution. It may be that low-rated players on very strong offenses get buried on the depth chart, but this chart cannot test that.
+
+## Conclusion
+Star ratings tell us something about a transfer's production, but not much: about +0.05 PPA per star after accounting for team and usage. The strength of the offense a player joins matters considerably more.
+
+**Limitations**
+- This shows association, not causation.
+- Players who barely played are excluded, so busts who never got on the field are missing.
+- PPA reflects the whole offense, not only the player.
+- About 1% of rows are repeated athlete-season pairs that I did not resolve.
