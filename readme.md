@@ -4,3 +4,401 @@
 ## Data Prep
 
 Here I want to merge in a new API connection
+
+``` python
+API_KEY = "api_here"
+HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+BASE = "https://api.collegefootballdata.com"
+
+def pull(endpoint, years=range(2021, 2026)):
+    frames = []
+    for year in years:
+        r = requests.get(f"{BASE}/{endpoint}", headers=HEADERS, params={"year": year})
+        r.raise_for_status()
+        frames.append(pd.json_normalize(r.json()))
+    return pd.concat(frames, ignore_index=True)
+
+records = pull("records").rename(columns={"year": "season"})
+ppa_teams = pull("ppa/teams")
+
+# Check the real column names before trusting the selections below
+print(records.columns.tolist())
+print(ppa_teams.columns.tolist())
+
+records_slim = records[["season", "team", "total.wins", "total.losses"]].rename(
+    columns={"total.wins": "team_wins", "total.losses": "team_losses"})
+
+records_slim["team_win_pct"] = records_slim["team_wins"] / (records_slim["team_wins"] + records_slim["team_losses"])
+
+ppa_slim = ppa_teams[["season", "team", "offense.overall", "defense.overall"]].rename(
+    columns={"offense.overall": "team_off_ppa", "defense.overall": "team_def_ppa"})
+
+team_success = records_slim.merge(ppa_slim, on=["season", "team"], how="left")
+
+team_success.to_csv("~/College-Football-Analysis/team_success.csv")
+```
+
+``` python
+import pandas as pd
+import requests
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy import stats
+import statsmodels.formula.api as smf
+
+cfb = pd.read_csv("~/College-Football-Analysis/master_cfb_2021-2025.csv", low_memory=False)
+team_success = pd.read_csv("~/College-Football-Analysis/team_success.csv")
+
+cfb = cfb.merge(team_success, on=["season", "team"], how="left")
+```
+
+## Quick sanity check of the data
+
+``` python
+cfb[["season", "team", "athlete_id", "name_ppa", "team_wins", "team_losses",
+        "team_win_pct", "team_off_ppa", "team_def_ppa"]].head(10)
+
+# Summary stats for just the new columns
+cfb[["team_wins","team_losses","team_win_pct", "team_off_ppa", "team_def_ppa"]].describe()
+
+# One row per team-season, to sanity-check the team data itself
+team_success.sort_values("team_win_pct", ascending=False).head(10)
+
+# 2. Missing values per column (% missing), worst first
+missing = (cfb.isna().mean() * 100).round(1).sort_values(ascending=False)
+print(missing.head(25))
+print((missing == 100).sum(), "columns are 100% empty")
+print((missing > 90).sum(), "columns are >90% empty")
+
+# 3. Duplicates
+print("Fully duplicated rows:", cfb.duplicated().sum())
+print("Duplicate athlete_id + season:", cfb.duplicated(subset=["athlete_id", "season"]).sum())
+
+# 4. Rows per season
+print(cfb["season"].value_counts().sort_index())
+cfb.columns
+```
+
+    ranking                       99.3
+    rating.x                      99.3
+    stars.x                       99.3
+    weight_hs                     99.2
+    height_hs                     99.2
+    country                       99.2
+    hometown_info_latitude_hs     99.2
+    hometown_info_longitude_hs    99.2
+    hometown_info_fips_code       99.2
+    position_hs                   99.2
+    city                          99.2
+    committed_to                  99.2
+    school                        99.2
+    name_hs                       99.2
+    year_hs                       99.2
+    recruit_type                  99.2
+    id                            99.2
+    state_province                99.2
+    punting_in_20                 97.2
+    punting_no                    97.2
+    punting_yds                   97.2
+    punting_ypp                   97.2
+    punting_long                  97.2
+    punting_tb                    97.2
+    pre_draft_ranking             97.1
+    dtype: float64
+    0 columns are 100% empty
+    75 columns are >90% empty
+    Fully duplicated rows: 0
+    Duplicate athlete_id + season: 734
+    season
+    2021    11894
+    2022    14374
+    2023    13742
+    2024    14093
+    2025    15082
+    Name: count, dtype: int64
+
+    Index(['name_clean', 'season', 'athlete_id', 'name_ppa', 'position_ppa',
+           'team_ppa', 'conference_ppa', 'avg_PPA_all', 'avg_PPA_pass',
+           'avg_PPA_rush',
+           ...
+           'transfer_date', 'rating.y', 'stars.y', 'eligibility', 'Unnamed: 0',
+           'team_wins', 'team_losses', 'team_win_pct', 'team_off_ppa',
+           'team_def_ppa'],
+          dtype='str', length=149)
+
+## For Fun: comparing offenses accross conferences
+
+``` python
+# 1. Sanity check: top 10 team-seasons by win % (8+ games to skip tiny samples)
+top = team_success[(team_success["team_wins"] + team_success["team_losses"]) >= 8]
+top.sort_values("team_win_pct", ascending=False).head(10)
+
+# 2. Attach conference to the team-level table
+conf_map = (
+    cfb.dropna(subset=["conference"])[["season", "team", "conference"]]
+    .drop_duplicates(["season", "team"])
+)
+team_conf = team_success.merge(conf_map, on=["season", "team"], how="inner")
+
+# 3. Keep only Power 5
+power5_confs = ["SEC", "ACC", "B1G", "B12", "PAC", "Ind"]
+p5 = team_conf[team_conf["conference"].isin(power5_confs)]
+
+# 4. Boxplot, ordered by median win %
+order = p5.groupby("conference")["team_win_pct"].median().sort_values(ascending=False).index
+
+sns.set_theme(style="whitegrid")
+
+plt.figure(figsize=(8, 5))
+sns.boxplot(data=p5, x="conference", y="team_win_pct", order=order)
+plt.title("Win Percentage by Power 5 Conferences, 2021-2025")
+plt.xlabel("Conference")
+plt.ylabel("Win Percentage")
+plt.show()
+```
+
+![](readme_files/figure-commonmark/cell-5-output-1.png)
+
+## How does Usage impact Predicted Points Added (PPA)
+
+``` python
+offense = cfb.dropna(subset=["avg_PPA_all", "usg_overall"]).copy()
+offense = offense[offense["position_ppa"].isin(["QB", "RB", "WR", "TE"])]
+
+sns.set_theme(style="whitegrid")
+g = sns.relplot(
+    data=offense,
+    x="usg_overall",
+    y="avg_PPA_all",
+    col="position_ppa",
+    col_order=["QB", "RB", "WR", "TE"],
+    col_wrap=2,
+    kind="scatter",
+    alpha=0.3,
+    s=15,
+    height=4,
+    aspect=1.2,
+)
+g.set_titles("{col_name}")
+g.set_axis_labels("Total Usage (share of team plays)", "Average PPA")
+g.figure.suptitle("Offense: Average PPA vs. Total Usage by Position, 2021-2025", y=1.02)
+plt.show()
+```
+
+![](readme_files/figure-commonmark/cell-6-output-1.png)
+
+## Creating Offense only transfer portal data frame
+
+``` python
+portal_cols = ["origin", "transfer_date", "rating.y", "stars.y", "eligibility"]
+
+transfers = cfb[cfb[portal_cols].notna().any(axis=1)].copy()
+
+print(transfers.shape) 
+missing = (transfers.isna().mean() * 100).round(1).sort_values(ascending=False)
+transfers.columns.tolist()
+drop_prefixes = (
+    "defensive_", "interceptions_",                  # defense
+    "kicking_", "kick_returns_", "punting_", "punt_returns_",  # special teams
+)
+
+drop_cols = [c for c in transfers.columns if c.startswith(drop_prefixes)]
+transfers = transfers.drop(columns=drop_cols)
+```
+
+    (3373, 149)
+
+## Do ratings indicate better play?
+
+``` python
+stars_df = transfers.dropna(subset=["stars.y"])
+stars_df = stars_df[
+    (stars_df["usg_overall"] >= 0.03)
+    & (stars_df["position_ppa"].isin(["QB", "RB", "WR", "TE"]))
+].copy()
+
+# Group stars: 2 or fewer / 3 / 4-5
+stars_df["stars_grp"] = (
+    stars_df["stars.y"].astype(int).clip(lower=2, upper=4)
+    .map({2: "2 or fewer", 3: "3", 4: "4-5"})
+)
+
+sns.set_theme(style="whitegrid")
+g = sns.catplot(
+    data=stars_df,
+    x="stars_grp",
+    y="avg_PPA_all",
+    col="position_ppa",
+    col_order=["QB", "RB", "WR", "TE"],
+    col_wrap=2,
+    order=["2 or fewer", "3", "4-5"],
+    kind="box",
+    showfliers=False,
+    height=4,
+    aspect=1.2,
+)
+g.set_titles("{col_name}")
+g.set_axis_labels("Transfer Portal Stars", "Average PPA")
+g.figure.suptitle("Average PPA by Transfer Star Rating and Position", y=1.02)
+plt.show()
+```
+
+![](readme_files/figure-commonmark/cell-8-output-1.png)
+
+## Do Transfer Portal Star Ratings Predict Production?
+
+**Question:** When a player enters the transfer portal, does their star
+rating tell us how well they’ll perform at their new school?
+
+**Data:** About 2,500 offensive transfers (QB, RB, WR, TE) from
+2021-2025. Production is measured by average PPA (predicted points added
+per play). Players with very few touches were excluded so tiny samples
+don’t distort results.
+
+``` python
+summary = (
+    stars_df.groupby(["position_ppa", "stars_grp"])["avg_PPA_all"]
+    .agg(
+        n="count",
+        median="median",
+        std="std",
+        iqr=lambda x: x.quantile(0.75) - x.quantile(0.25),
+    )
+    .round(3)
+)
+print(summary)
+
+# 2. Tests per position
+rows = []
+for pos, d in stars_df.groupby("position_ppa"):
+    groups = [g["avg_PPA_all"] for _, g in d.groupby("stars_grp")]
+    h, p_kw = stats.kruskal(*groups)
+
+    rated = d.dropna(subset=["rating.y"])
+    rho, p_sp = stats.spearmanr(rated["rating.y"], rated["avg_PPA_all"])
+
+    rows.append({"position": pos, "kruskal_p": round(p_kw, 4),
+                 "spearman_rho": round(rho, 3), "spearman_p": round(p_sp, 4),
+                 "n_rated": len(rated)})
+print(pd.DataFrame(rows))
+```
+
+                               n  median    std    iqr
+    position_ppa stars_grp                            
+    QB           2 or fewer   33   0.207  0.233  0.245
+                 3           486   0.196  0.262  0.276
+                 4-5          85   0.278  0.282  0.175
+    RB           2 or fewer   43   0.148  0.177  0.214
+                 3           579   0.109  0.213  0.245
+                 4-5          72   0.180  0.213  0.244
+    TE           2 or fewer    7   0.463  0.505  0.393
+                 3           138   0.554  0.496  0.611
+                 4-5          32   0.705  0.342  0.440
+    WR           2 or fewer   64   0.567  0.545  0.580
+                 3           786   0.617  0.423  0.509
+                 4-5         153   0.755  0.338  0.434
+      position  kruskal_p  spearman_rho  spearman_p  n_rated
+    0       QB     0.0049         0.201      0.0000      418
+    1       RB     0.0322         0.174      0.0002      459
+    2       TE     0.0556         0.196      0.0275      127
+    3       WR     0.0005         0.218      0.0000      651
+
+**Findings** - Higher-rated transfers tend to produce more. At every
+position, 4-5 star transfers had a higher median PPA than 3-star
+transfers (for example, WRs: 0.76 vs. 0.62). - The relationship is real
+but weak. Correlations between rating and PPA were around 0.2 at every
+position, meaning a rating explains only a small share of how a player
+performs. Many low-rated transfers outplayed high-rated ones. -
+Statistical tests (Kruskal-Wallis, Spearman correlation) support the
+pattern for QB, RB, and WR. TE is borderline because of its small
+sample.
+
+**Takeaway:** Star ratings are a useful starting point for evaluating a
+transfer, but they are far from the whole story.
+
+## Regression
+
+``` python
+reg = transfers.dropna(subset=["stars.y", "team_off_ppa"])
+reg = reg[
+    (reg["usg_overall"] >= 0.03)
+    & reg["position_ppa"].isin(["QB", "RB", "WR", "TE"])
+].copy()
+reg = reg.rename(columns={"stars.y": "stars"})
+
+# Model 1: stars + position only
+m0 = smf.ols("avg_PPA_all ~ stars + C(position_ppa)", data=reg).fit(cov_type="HC3")
+
+# Model 2: add usage and team offense
+m1 = smf.ols(
+    "avg_PPA_all ~ stars + usg_overall + C(position_ppa) + team_off_ppa",
+    data=reg,
+).fit(cov_type="HC3")
+
+print(m0.summary().tables[1])
+print(m1.summary().tables[1])
+print("R2:", round(m0.rsquared, 3), round(m1.rsquared, 3))
+```
+
+    =========================================================================================
+                                coef    std err          z      P>|z|      [0.025      0.975]
+    -----------------------------------------------------------------------------------------
+    Intercept                -0.0784      0.053     -1.486      0.137      -0.182       0.025
+    C(position_ppa)[T.RB]    -0.0661      0.015     -4.449      0.000      -0.095      -0.037
+    C(position_ppa)[T.TE]     0.4110      0.040     10.171      0.000       0.332       0.490
+    C(position_ppa)[T.WR]     0.4673      0.018     25.671      0.000       0.432       0.503
+    stars                     0.0852      0.016      5.257      0.000       0.053       0.117
+    =========================================================================================
+    =========================================================================================
+                                coef    std err          z      P>|z|      [0.025      0.975]
+    -----------------------------------------------------------------------------------------
+    Intercept                -0.1187      0.057     -2.066      0.039      -0.231      -0.006
+    C(position_ppa)[T.RB]    -0.0236      0.025     -0.959      0.338      -0.072       0.025
+    C(position_ppa)[T.TE]     0.4714      0.048      9.748      0.000       0.377       0.566
+    C(position_ppa)[T.WR]     0.5326      0.031     17.014      0.000       0.471       0.594
+    stars                     0.0487      0.017      2.942      0.003       0.016       0.081
+    usg_overall               0.2535      0.068      3.730      0.000       0.120       0.387
+    team_off_ppa              0.6724      0.073      9.151      0.000       0.528       0.816
+    =========================================================================================
+    R2: 0.375 0.406
+
+## Being on a better offense effects PPA more than stars
+
+``` python
+viz = transfers.dropna(subset=["stars.y", "team_off_ppa"])
+viz = viz[
+    (viz["usg_overall"] >= 0.03)
+    & viz["position_ppa"].isin(["QB", "RB", "WR", "TE"])
+].copy()
+
+# PPA relative to the player's position average, so QBs and WRs are comparable
+viz["ppa_vs_pos"] = viz["avg_PPA_all"] - viz.groupby("position_ppa")["avg_PPA_all"].transform("mean")
+
+# Star groups and offense tiers (thirds of team offensive PPA)
+viz["stars_grp"] = (
+    viz["stars.y"].astype(int).clip(lower=2, upper=4)
+    .map({2: "2 or fewer", 3: "3", 4: "4-5"})
+)
+viz["offense_tier"] = pd.qcut(
+    viz["team_off_ppa"], 3, labels=["Weak offense", "Average offense", "Strong offense"]
+)
+
+sns.set_theme(style="whitegrid")
+plt.figure(figsize=(9, 6))
+sns.barplot(
+    data=viz,
+    x="offense_tier",
+    y="ppa_vs_pos",
+    hue="stars_grp",
+    hue_order=["2 or fewer", "3", "4-5"],
+    errorbar=None,
+    palette="Blues",
+)
+plt.title("Where a Transfer Lands Matters More Than Their Star Rating")
+plt.xlabel("Strength of New Team's Offense")
+plt.ylabel("PPA vs. Position Average")
+plt.legend(title="Portal Stars")
+plt.show()
+```
+
+![](readme_files/figure-commonmark/cell-11-output-1.png)
